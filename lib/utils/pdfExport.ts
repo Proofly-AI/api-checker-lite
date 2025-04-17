@@ -1,432 +1,320 @@
 import { jsPDF } from 'jspdf';
-import { SessionInfoResponse } from '@/lib/types/proofly';
-import { formatAnalysisResults } from '@/lib/types/proofly';
+import { SessionInfoResponse, formatAnalysisResults, AnalysisResult } from '@/lib/types/proofly';
 import { prooflyApi } from '@/lib/api/proofly';
 
+// Helper function for formatting percentages
+const formatPercent = (value: number): string => {
+  return (value * 100).toFixed(2) + '%';
+};
+
+// Helper function to load an image as base64
+async function loadImageAsBase64(url: string): Promise<string> {
+  try {
+    const fetchUrl = `${url}?t=${new Date().getTime()}`;
+    const response = await fetch(fetchUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    if (typeof window !== 'undefined') {
+      const blob = new Blob([arrayBuffer]);
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    } else {
+      const buffer = Buffer.from(arrayBuffer);
+      const extension = url.split('.').pop()?.toLowerCase() || 'png';
+      const mimeType = extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' : 'image/png';
+      return `data:${mimeType};base64,${buffer.toString('base64')}`;
+    }
+  } catch (error) {
+    console.error('Error loading image:', error);
+    throw error;
+  }
+}
+
 /**
- * Function for exporting analysis results to PDF
- * @param sessionInfo Session information with analysis results
- * @returns Promise with export result
+ * Exports analysis results to a PDF in certificate style.
+ * @param sessionInfo Session information with analysis results.
+ * @returns Promise with export result.
  */
 export const exportResultsToPDF = async (sessionInfo: SessionInfoResponse): Promise<{ success: boolean; error?: string }> => {
   try {
-    // Get analysis results
     const analysisResults = formatAnalysisResults(sessionInfo);
-    
-    // Create PDF document A4 format
+    let logoBase64: string | null = null;
+    let logoProps: any | null = null;
+
+    // Load logo
+    try {
+      logoBase64 = await loadImageAsBase64('/logo.png');
+    } catch (logoError) {
+      console.error('PDF Export: Failed to load logo.png', logoError);
+    }
+
     const pdf = new jsPDF('p', 'mm', 'a4');
-    
-    // Connect font for Cyrillic support
-    // This is an important step - adding Cyrillic support
-    pdf.addFont('/fonts/PTSans-Regular.ttf', 'PTSans', 'normal');
-    pdf.addFont('/fonts/PTSans-Bold.ttf', 'PTSans', 'bold');
-    pdf.setFont('PTSans');
-    
+    pdf.setFont('helvetica');
+
+    // Set PDF metadata
+    pdf.setProperties({
+      title: `Proofly Analysis Report - ${sessionInfo.uuid}`,
+      subject: `Deepfake Analysis Results for Session ${sessionInfo.uuid}`,
+      author: 'Proofly AI',
+      keywords: `proofly, deepfake, analysis, report, ${sessionInfo.uuid}`,
+      creator: 'Proofly AI App',
+    });
+
+    // Get logo properties if loaded
+    if (logoBase64) {
+      try {
+        logoProps = pdf.getImageProperties(logoBase64);
+      } catch (propsError) {
+        console.error('PDF Export: Failed to get logo properties', propsError);
+        logoBase64 = null;
+      }
+    }
+
     const width = pdf.internal.pageSize.getWidth();
     const height = pdf.internal.pageSize.getHeight();
-    
-    /**
-     * Helper function to draw probability bars
-     * @param pdf PDF document
-     * @param result Analysis result for face
-     * @param startX X coordinate to start drawing from
-     * @param startY Y coordinate to start drawing from
-     * @param barWidth Width of progress bars
-     * @return Height of drawn content
-     */
-    const drawProbabilityBars = (
-      pdf: jsPDF,
-      result: any,
-      startX: number,
-      startY: number,
-      barWidth: number
-    ): number => {
-      let currentY = startY;
-      const barHeight = 3; // progress bar height
-      
-      // --- REAL IMAGE PROBABILITY ---
-      pdf.setFontSize(10);
-      pdf.setFont('PTSans', 'normal');
-      pdf.setTextColor(0, 0, 0);
-      pdf.text('Real Image Probability', startX, currentY);
-      currentY += 6;
-      
-      // Progress bar background (gray)
-      pdf.setFillColor(230, 230, 230);
-      pdf.rect(startX, currentY, barWidth, barHeight, 'F');
-      
-      // Filled part of progress bar
-      const realProbabilityWidth = barWidth * result.ensembleProbability.real;
-      
-      // Choose color based on value
-      if (result.ensembleProbability.real > 0.7) {
-        pdf.setFillColor(0, 200, 0); // green
-      } else if (result.ensembleProbability.real < 0.3) {
-        pdf.setFillColor(200, 0, 0); // red
-      } else {
-        pdf.setFillColor(200, 150, 0); // orange
-      }
-      
-      pdf.rect(startX, currentY, realProbabilityWidth, barHeight, 'F');
-      
-      // Percentage and label
-      pdf.setFontSize(9);
-      pdf.text(`${(result.ensembleProbability.real * 100).toFixed(2)}%`, startX, currentY + 7);
-      pdf.text('Model Ensemble Confidence', startX + barWidth - 10, currentY + 7, { align: 'right' });
-      
-      currentY += 14; // Margin for next element
-      
-      // --- DEEPFAKE PROBABILITY ---
-      pdf.setFontSize(10);
-      pdf.text('Deepfake Probability', startX, currentY);
-      currentY += 6;
-      
-      // Progress bar background (gray)
-      pdf.setFillColor(230, 230, 230);
-      pdf.rect(startX, currentY, barWidth, barHeight, 'F');
-      
-      // Filled part of progress bar
-      const fakeProbabilityWidth = barWidth * result.ensembleProbability.fake;
-      
-      // Choose color based on value (inverted relative to real)
-      if (result.ensembleProbability.fake < 0.3) {
-        pdf.setFillColor(0, 200, 0); // green
-      } else if (result.ensembleProbability.fake > 0.7) {
-        pdf.setFillColor(200, 0, 0); // red
-      } else {
-        pdf.setFillColor(200, 150, 0); // orange
-      }
-      
-      pdf.rect(startX, currentY, fakeProbabilityWidth, barHeight, 'F');
-      
-      // Percentage and label
-      pdf.setFontSize(9);
-      pdf.text(`${(result.ensembleProbability.fake * 100).toFixed(2)}%`, startX, currentY + 7);
-      pdf.text('Model Ensemble Confidence', startX + barWidth - 10, currentY + 7, { align: 'right' });
-      
-      currentY += 10; // Final margin
-      
-      // Return total height used
-      return currentY - startY;
-    };
-    
-    // Function to load images
-    const loadImage = (url: string) => {
-      return new Promise<HTMLImageElement>((resolve, reject) => {
-        const img = new Image();
-        img.crossOrigin = 'Anonymous';
-        img.onload = () => resolve(img);
-        img.onerror = (err) => reject(err);
-        img.src = url;
-      });
-    };
-    
-    try {
-      // Load logo from public directory
-      const logoUrl = '/logo.png';
-      const logoImage = await loadImage(logoUrl);
-      
-      // Add logo (centered at the top)
-      const logoWidth = 40; // logo width in mm
-      const logoHeight = (logoImage.height * logoWidth) / logoImage.width; // maintain proportions
-      const logoX = (width - logoWidth) / 2; // horizontal centering
-      
-      // Create canvas for logo
-      const logoCanvas = document.createElement('canvas');
-      logoCanvas.width = logoImage.width;
-      logoCanvas.height = logoImage.height;
-      const logoContext = logoCanvas.getContext('2d');
-      if (logoContext) {
-        logoContext.drawImage(logoImage, 0, 0);
-      }
-      
-      // Get logo data
-      const logoData = logoCanvas.toDataURL('image/png');
-      
-      // Add logo at the top
-      pdf.addImage({
-        imageData: logoData,
-        format: 'PNG',
-        x: logoX,
-        y: 10, 
-        width: logoWidth,
-        height: logoHeight
-      });
-      
-      // Move title down after logo
-      const titleY = 10 + logoHeight + 10; // 10mm margin after logo
-      
-      // Get current date
-      const currentDate = new Date().toLocaleDateString('en-US');
-      
-      // Add title and session information
-      pdf.setFontSize(14);
-      pdf.setFont('PTSans', 'bold');
-      pdf.text(`Image Analysis Report - ${currentDate}`, width / 2, titleY, { align: 'center' });
-      
-      pdf.setFontSize(10);
-      pdf.setFont('PTSans', 'normal');
-      
-      // Display SHA256 and UUID in requested order
-      if (sessionInfo.sha256) {
-        pdf.text(`SHA256: ${sessionInfo.sha256}`, 14, titleY + 10);
-      }
-      
-      pdf.text(`UUID: ${sessionInfo.uuid}`, 14, titleY + 17);
-      
-      // Initial position for content
-      let yPos = titleY + 30; // Adjusted to account for removed Date line
-      
-      // Add information about analysis results programmatically
-      if (!sessionInfo.faces || sessionInfo.faces.length === 0) {
-        // Case when no faces are detected
-        pdf.setFontSize(12);
-        pdf.text('No faces detected in the image', width / 2, yPos, { align: 'center' });
-      } else {
-        // Process each detected face
-        for (let faceIndex = 0; faceIndex < sessionInfo.faces.length; faceIndex++) {
-          // Start new page for each face (except first one which is already on first page)
-          if (faceIndex > 0) {
-            pdf.addPage();
-            yPos = 20; // Reset Y position for new page
-          }
+    const margin = 15;
+    const contentWidth = width - 2 * margin;
+    const leftCol = margin + 5;
+    const rightCol = margin + 55;
+    let yPos = 0;
 
-          const result = analysisResults[faceIndex];
-          
-          if (!result) continue;
-          
-          // Add header for each face
-          pdf.setFontSize(14);
-          pdf.setFont('PTSans', 'bold');
-          pdf.setTextColor(0, 0, 0);
-          pdf.text(`Face ${result.faceIndex}`, 14, yPos);
-          pdf.setFont('PTSans', 'normal');
-          yPos += 8;
-          
-          // Try to add face image if possible
-          try {
-            if (faceIndex < sessionInfo.faces.length) {
-              const faceImageUrl = prooflyApi.getFaceImageUrl(sessionInfo.uuid, faceIndex);
-              const faceImage = await loadImage(faceImageUrl);
-              
-              // Define face image dimensions
-              const faceImageWidth = 50; // width in mm
-              const faceImageHeight = (faceImage.height * faceImageWidth) / faceImage.width;
-              
-              // Create canvas for face image
-              const faceCanvas = document.createElement('canvas');
-              faceCanvas.width = faceImage.width;
-              faceCanvas.height = faceImage.height;
-              const faceContext = faceCanvas.getContext('2d');
-              if (faceContext) {
-                faceContext.drawImage(faceImage, 0, 0);
-              }
-              
-              // Get face image data
-              const faceImageData = faceCanvas.toDataURL('image/png');
-              
-              // Add face image
-              pdf.addImage({
-                imageData: faceImageData,
-                format: 'PNG',
-                x: 14,
-                y: yPos,
-                width: faceImageWidth,
-                height: faceImageHeight
-              });
-              
-              // Place probability bars on the right side of the image
-              const rightColumnX = faceImageWidth + 20; // Start right column after image with margin
-              
-              // Determine verdict text
-              let verdictText = "Likely Real"; // default value
-              
-              if (result.ensembleProbability.real > 0.7) {
-                verdictText = "Likely Real";
-              } else if (result.ensembleProbability.real < 0.3) {
-                verdictText = "Likely Deepfake";
-              } else {
-                verdictText = "Uncertain Result";
-              }
-              
-              // Right column should be exactly aligned with image top
-              const rightColumnY = yPos + 3; // No offset, align exactly with image top
-              
-              // Display verdict in single line at the top of right column
-              pdf.setFontSize(12);
-              pdf.setFont('PTSans', 'bold');
-              pdf.setTextColor(0, 0, 0);
-              pdf.text(`Verdict: ${verdictText}`, rightColumnX, rightColumnY);
-              
-              // Reset to normal font and ensure we reset text color
-              pdf.setFont('PTSans', 'normal');
-              pdf.setTextColor(0, 0, 0);
-              
-              // Draw probability bars to the right of the image
-              // Start probability bars a bit below the verdict text
-              drawProbabilityBars(pdf, result, rightColumnX, rightColumnY + 7, 90);
-              
-              // Move position after the face section
-              yPos += faceImageHeight + 10;
-            }
-          } catch (faceImgError) {
-            console.error('Failed to load face image:', faceImgError);
-            pdf.setFontSize(10);
-            pdf.setTextColor(150, 0, 0);
-            pdf.text('Failed to load face image', 14, yPos);
-            yPos += 10;
-            
-            // Add verdict
-            pdf.setFontSize(12);
-            pdf.setFont('PTSans', 'bold');
-            pdf.setTextColor(0, 0, 0);
-            
-            // Determine verdict text
-            let verdictText = "Likely Real"; // default value
-            
-            if (result.ensembleProbability.real > 0.7) {
-              verdictText = "Likely Real";
-            } else if (result.ensembleProbability.real < 0.3) {
-              verdictText = "Likely Deepfake";
-            } else {
-              verdictText = "Uncertain Result";
-            }
-            
-            // Display verdict
-            pdf.text(`Verdict: ${verdictText}`, 14, yPos);
-            
-            // Reset font and draw probability bars vertically (when image fails)
-            pdf.setFont('PTSans', 'normal');
-            pdf.setTextColor(0, 0, 0);
-            yPos += 10;
-            
-            // Draw probability bars (stacked vertically when image fails)
-            const heightUsed = drawProbabilityBars(pdf, result, 14, yPos, 150);
-            yPos += heightUsed + 5;
-          }
-          
-          // --- INDIVIDUAL MODEL RESULTS ---
-          pdf.setFontSize(12);
-          pdf.setFont('PTSans', 'bold');
-          pdf.text('Individual Model Results', 14, yPos);
-          pdf.setFont('PTSans', 'normal');
-          yPos += 8;
-          
-          // Define positioning for model bars
-          const modelBarX = 14;
-          const modelBarWidth = 150;
-          const modelBarHeight = 3;
-          
-          // Add results for each model
-          for (let i = 0; i < result.modelProbabilities.length; i++) {
-            const model = result.modelProbabilities[i];
-            
-            // Use model name instead of just number
-            const modelName = model.model ? `Model ${model.model}` : `Model ${i + 1}`;
-            
-            pdf.setFontSize(9);
-            pdf.text(modelName, 14, yPos);
-            pdf.text(`${(model.realProbability * 100).toFixed(2)}%`, modelBarX + modelBarWidth - 10, yPos, { align: 'right' });
-            yPos += 4;
-            
-            // Draw progress bar for model
-            pdf.setFillColor(230, 230, 230);
-            pdf.rect(modelBarX, yPos, modelBarWidth, modelBarHeight, 'F');
-            
-            // Filled part of progress bar
-            const modelProbabilityWidth = modelBarWidth * model.realProbability;
-            
-            // Choose color based on value
-            if (model.realProbability > 0.7) {
-              pdf.setFillColor(0, 200, 0);
-            } else if (model.realProbability < 0.3) {
-              pdf.setFillColor(200, 0, 0);
-            } else {
-              pdf.setFillColor(200, 150, 0);
-            }
-            
-            pdf.rect(modelBarX, yPos, modelProbabilityWidth, modelBarHeight, 'F');
-            
-            yPos += 8;
-          }
-        }
+    // Page break helper
+    const checkPageBreak = (currentY: number, requiredSpace: number): number => {
+      const safeBottomMargin = 30;
+      if (currentY + requiredSpace > height - safeBottomMargin) {
+        pdf.addPage();
+        pdf.setDrawColor(0);
+        pdf.setLineWidth(1);
+        pdf.rect(margin, margin, contentWidth, height - 2 * margin);
+        return margin + 15;
       }
-      
-      // Add metadata
-      pdf.setProperties({
-        title: `Proofly Checker - Report (${sessionInfo.uuid})`,
-        subject: 'Image Analysis for Deepfakes',
-        creator: 'Proofly Checker',
-        keywords: 'analysis, deepfake, image'
-      });
-      
-      // Add footer to all pages
-      const pageCount = pdf.internal.pages.length - 1;
-      for (let i = 1; i <= pageCount; i++) {
-        pdf.setPage(i);
-        pdf.setFontSize(8);
-        pdf.setTextColor(100, 100, 100);
-        
-        // Add company information
-        pdf.text('© Proofly AI, 2025 - All Rights Reserved - www.proofly.ai', width/2, height - 10, { align: 'center' });
-        
-        // Page number
-        if (pageCount > 1) {
-          pdf.text(`Page ${i} of ${pageCount}`, width - 20, height - 5);
-        }
-      }
-      
-      // Save PDF
-      pdf.save(`proofly-report-${sessionInfo.uuid}.pdf`);
-      
-      return { success: true };
-    } catch (imgError) {
-      console.error('Error creating PDF:', imgError);
-      
-      // Create PDF with text information only if images failed to load
-      const pdf = new jsPDF('p', 'mm', 'a4');
-      
-      // Connect font for Cyrillic support
-      pdf.addFont('/fonts/PTSans-Regular.ttf', 'PTSans', 'normal');
-      pdf.addFont('/fonts/PTSans-Bold.ttf', 'PTSans', 'bold');
-      pdf.setFont('PTSans');
-      
-      const width = pdf.internal.pageSize.getWidth();
-      const height = pdf.internal.pageSize.getHeight();
-      
-      // For fallback PDF without images
-      const titleY = 20;
-      
-      // Get current date
-      const currentDate = new Date().toLocaleDateString('en-US');
-      
-      pdf.setFontSize(14);
-      pdf.setFont('PTSans', 'bold');
-      pdf.text(`Image Analysis Report - ${currentDate}`, width / 2, titleY, { align: 'center' });
-      
-      pdf.setFontSize(10);
-      pdf.setFont('PTSans', 'normal');
-      
-      // Display SHA256 and UUID in requested order
-      if (sessionInfo.sha256) {
-        pdf.text(`SHA256: ${sessionInfo.sha256}`, 14, titleY + 10);
-      }
-      
-      pdf.text(`UUID: ${sessionInfo.uuid}`, 14, titleY + 17);
-      pdf.text('Error loading images. Report contains text information only.', 14, titleY + 30);
-      
-      // Add footer
+      return currentY;
+    };
+
+    // Footer helper
+    const addFooter = (logoBase64Data: string | null, logoProperties: any | null) => {
+      const footerY = height - margin - 15;
+      pdf.setLineWidth(0.5);
+      pdf.line(margin, footerY, width - margin, footerY);
       pdf.setFontSize(8);
+      pdf.setFont('helvetica', 'normal');
       pdf.setTextColor(100, 100, 100);
-      pdf.text('© Proofly AI, 2025 - All Rights Reserved - www.proofly.ai', width/2, height - 10, { align: 'center' });
-      
-      // Save PDF
-      pdf.save(`proofly-report-${sessionInfo.uuid}.pdf`);
-      
-      return { success: true, error: 'Created report without images due to loading error' };
+      if (logoBase64Data && logoProperties) {
+        const logoHeight = 8;
+        const logoWidth = (logoProperties.width * logoHeight) / logoProperties.height;
+        const logoX = margin + 5;
+        const logoY = footerY + 3;
+        try {
+          pdf.addImage(logoBase64Data, 'PNG', logoX, logoY, logoWidth, logoHeight);
+        } catch (imgError) {
+          console.error('PDF Export: Error adding logo to footer', imgError);
+        }
+      }
+      pdf.text('Proofly AI, 2025 - All Rights Reserved - www.proofly.ai', width / 2, footerY + 8, { align: 'center' });
+      const pageInfo = pdf.getCurrentPageInfo();
+      const pageCount = pdf.getNumberOfPages();
+      if (pageCount > 1) {
+        pdf.text(`Page ${pageInfo.pageNumber} of ${pageCount}`, width - margin - 5, footerY + 8, { align: 'right' });
+      }
+    };
+
+    // --- FIRST PAGE ---
+    pdf.setDrawColor(0);
+    pdf.setLineWidth(1);
+    pdf.rect(margin, margin, contentWidth, height - 2 * margin);
+
+    // Title
+    pdf.setFontSize(20);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('ANALYSIS REPORT', width / 2, margin + 20, { align: 'center' });
+    pdf.setFontSize(10);
+    pdf.setFont('helvetica', 'normal');
+    pdf.text('Deepfake Detection Analysis Results', width / 2, margin + 28, { align: 'center' });
+    const reportDate = new Date().toLocaleDateString();
+    pdf.text(`Report generated on: ${reportDate}`, width / 2, margin + 34, { align: 'center' });
+    yPos = margin + 45;
+    pdf.setLineWidth(0.5);
+    pdf.line(margin, yPos, width - margin, yPos);
+    yPos += 10;
+
+    // --- SESSION DETAILS ---
+    yPos = checkPageBreak(yPos, 30);
+    pdf.setFontSize(14);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('SESSION DETAILS', margin + 5, yPos);
+    yPos += 8;
+    pdf.setFontSize(10);
+    const addDetail = (label: string, value: string | undefined) => {
+      if (!value) return;
+      yPos = checkPageBreak(yPos, 7);
+      pdf.setFont('helvetica', 'bold');
+      pdf.text(label, leftCol, yPos);
+      pdf.setFont('helvetica', 'normal');
+      const splitValue = pdf.splitTextToSize(value, contentWidth - (rightCol - margin));
+      pdf.text(splitValue, rightCol, yPos);
+      yPos += splitValue.length * 5;
+      yPos += 3;
+    };
+    addDetail('Session UUID:', sessionInfo.uuid);
+    addDetail('SHA256 Hash:', sessionInfo.sha256);
+    yPos += 5;
+    pdf.setLineWidth(0.5);
+    pdf.line(margin, yPos, width - margin, yPos);
+    yPos += 10;
+
+    // --- FACE ANALYSIS DETAILS ---
+    yPos = checkPageBreak(yPos, 20);
+    pdf.setFontSize(14);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('FACE ANALYSIS DETAILS', margin + 5, yPos);
+    yPos += 10;
+
+    if (!analysisResults || analysisResults.length === 0) {
+      yPos = checkPageBreak(yPos, 10);
+      pdf.setFontSize(11);
+      pdf.setFont('helvetica', 'normal');
+      pdf.text('No faces detected in the image.', leftCol, yPos);
+      yPos += 10;
+    } else {
+      for (let i = 0; i < analysisResults.length; i++) {
+        const result = analysisResults[i];
+        yPos = checkPageBreak(yPos, 100);
+        pdf.setFontSize(12);
+        pdf.setFont('helvetica', 'bold');
+        pdf.text(`Face ${result.faceIndex}:`, margin + 5, yPos);
+        yPos += 8;
+        let faceImageBase64: string | null = null;
+        let faceImageError = false;
+        try {
+          const faceImageUrl = prooflyApi.getFaceImageUrl(sessionInfo.uuid, result.faceIndex - 1);
+          faceImageBase64 = await loadImageAsBase64(faceImageUrl);
+        } catch (err) {
+          console.error(`PDF Export: Failed to load image for face ${result.faceIndex}`, err);
+          faceImageError = true;
+        }
+        const faceDataStartY = yPos;
+        const imageWidth = 50;
+        let imageRenderedHeight = 0;
+        if (faceImageBase64) {
+          try {
+            const imgProps = pdf.getImageProperties(faceImageBase64);
+            imageRenderedHeight = (imgProps.height * imageWidth) / imgProps.width;
+            yPos = checkPageBreak(yPos, imageRenderedHeight + 5);
+            pdf.addImage(faceImageBase64, 'PNG', leftCol, yPos, imageWidth, imageRenderedHeight);
+            const verdictUpper = result.verdict.toUpperCase();
+            let frameColor: number[] | null = null;
+            if (verdictUpper.includes('REAL')) {
+              frameColor = [0, 128, 0];
+            } else if (verdictUpper.includes('FAKE')) {
+              frameColor = [200, 0, 0];
+            }
+            if (frameColor) {
+              pdf.setDrawColor(frameColor[0], frameColor[1], frameColor[2]);
+              pdf.setLineWidth(1);
+              pdf.rect(leftCol, yPos, imageWidth, imageRenderedHeight);
+              pdf.setDrawColor(0);
+              pdf.setLineWidth(0.2);
+            }
+          } catch (imgAddError) {
+            console.error(`PDF Export: Failed to add image for face ${result.faceIndex}`, imgAddError);
+            faceImageError = true;
+            imageRenderedHeight = 0;
+            pdf.setFontSize(9);
+            pdf.setTextColor(150, 0, 0);
+            pdf.text('Error adding face image', leftCol + 5, yPos + 5);
+            pdf.setTextColor(0);
+            yPos += 10;
+          }
+        } else if (faceImageError) {
+          yPos = checkPageBreak(yPos, 10);
+          pdf.setFontSize(9);
+          pdf.setTextColor(150, 0, 0);
+          pdf.text('Failed to load face image', leftCol + 5, yPos + 5);
+          pdf.setTextColor(0);
+          yPos += 10;
+        }
+        const textStartX = faceImageBase64 && imageRenderedHeight > 0 ? leftCol + imageWidth + 15 : leftCol + 5;
+        const textStartY = faceDataStartY;
+        let textCurrentY = textStartY;
+        const textBlockWidth = contentWidth - (textStartX - margin);
+        const addFaceDetail = (label: string, value: string, valueColor: number[] | null = null) => {
+          textCurrentY = checkPageBreak(textCurrentY, 7);
+          pdf.setFontSize(10);
+          pdf.setFont('helvetica', 'bold');
+          pdf.text(label, textStartX, textCurrentY);
+          pdf.setFont('helvetica', 'normal');
+          if (valueColor) {
+            pdf.setTextColor(valueColor[0], valueColor[1], valueColor[2]);
+          }
+          const valueStartX = textStartX + 40;
+          const valueWidth = contentWidth - valueStartX - margin + 5;
+          const splitValue = pdf.splitTextToSize(value, valueWidth);
+          pdf.text(splitValue, valueStartX, textCurrentY);
+          if (valueColor) {
+            pdf.setTextColor(0);
+          }
+          textCurrentY += splitValue.length * 5 + 2;
+        };
+        let verdictColor: number[] | null = null;
+        const verdictUpper = result.verdict.toUpperCase();
+        if (verdictUpper.includes('REAL')) verdictColor = [0, 128, 0];
+        else if (verdictUpper.includes('FAKE')) verdictColor = [200, 0, 0];
+        else verdictColor = [200, 150, 0];
+        addFaceDetail('Verdict:', result.verdict, verdictColor);
+        addFaceDetail('Real Probability:', formatPercent(result.ensembleProbability.real));
+        addFaceDetail('Deepfake Probability:', formatPercent(result.ensembleProbability.fake));
+        textCurrentY += 5;
+        textCurrentY = checkPageBreak(textCurrentY, 15);
+        pdf.setFontSize(11);
+        pdf.setFont('helvetica', 'bold');
+        pdf.text('Individual Model Scores:', textStartX, textCurrentY);
+        textCurrentY += 6;
+        pdf.setFontSize(9);
+        pdf.setFont('helvetica', 'normal');
+        for (const model of result.modelProbabilities) {
+          textCurrentY = checkPageBreak(textCurrentY, 6);
+          const modelText = `Model ${model.model}: ${formatPercent(model.realProbability)}`;
+          const splitModelText = pdf.splitTextToSize(modelText, textBlockWidth - 5);
+          pdf.text(splitModelText, textStartX, textCurrentY);
+          textCurrentY += splitModelText.length * 4 + 1;
+        }
+        yPos = Math.max(yPos + imageRenderedHeight + 10, textCurrentY + 10);
+        if (i < analysisResults.length - 1) {
+          yPos = checkPageBreak(yPos, 10);
+          pdf.setLineWidth(0.3);
+          pdf.line(margin, yPos, width - margin, yPos);
+          yPos += 10;
+        }
+      }
     }
+    const pageCount = pdf.getNumberOfPages();
+    for (let i = 1; i <= pageCount; i++) {
+      pdf.setPage(i);
+      addFooter(logoBase64, logoProps);
+    }
+    pdf.save(`proofly-report-${sessionInfo.uuid}.pdf`);
+    return { success: true };
   } catch (error) {
-    console.error('Error creating PDF:', error);
-    return { success: false, error: 'Error creating PDF report' };
+    console.error('Error creating PDF report:', error);
+    try {
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      pdf.setFont('helvetica');
+      const width = pdf.internal.pageSize.getWidth();
+      pdf.setFontSize(12);
+      pdf.text('Error generating PDF report.', width / 2, 30, { align: 'center' });
+      if (error instanceof Error) {
+        pdf.text(`Details: ${error.message}`, 15, 40, { maxWidth: width - 30 });
+      }
+      pdf.save(`proofly-report-error-${sessionInfo.uuid}.pdf`);
+      return { success: false, error: `Error creating PDF: ${error instanceof Error ? error.message : String(error)}` };
+    } catch (fallbackError) {
+      return { success: false, error: 'Failed to create even an error PDF.' };
+    }
   }
-}; 
+};
