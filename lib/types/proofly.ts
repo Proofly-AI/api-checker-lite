@@ -172,11 +172,11 @@ export function formatAnalysisResults(sessionInfo: SessionInfoResponse): Analysi
     if (!verdict) {
       if (ensembleReal > 0.95) {
         verdict = 'Likely Real';
-      } else if (ensembleReal > 0.7) {
+      } else if (ensembleReal > 0.91) {
         verdict = 'Probably Real';
-      } else if (ensembleReal > 0.3) {
+      } else if (ensembleReal > 0.89) {
         verdict = 'Uncertain';
-      } else if (ensembleReal > 0.05) {
+      } else if (ensembleReal > 0.87) {
         verdict = 'Probably Deepfake';
       } else {
         verdict = 'Likely Deepfake';
