@@ -6,6 +6,12 @@ const API_BASE_URL = 'https://api.proofly.ai/api';
 /**
  * Proxy handler for retrieving Proofly session information
  */
+// --- UUID VALIDATION ---
+function isValidUuid(uuid: string): boolean {
+  // Any standard UUID (v1-v5, v7)
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid);
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: { uuid: string } }
@@ -13,6 +19,16 @@ export async function GET(
   try {
     const paramsObj = await params;
     const { uuid } = paramsObj;
+    // 2.1. UUID validation (any standard UUID)
+    if (!isValidUuid(uuid)) {
+      console.error('[SECURITY] Invalid UUID format:', uuid);
+      return NextResponse.json({ error: 'Invalid session identifier' }, { status: 400 });
+    }
+    // 2.2. Path traversal
+    if (uuid.includes('..') || /%2e%2e/i.test(uuid)) {
+      console.error('[SECURITY] Path traversal attempt in UUID:', uuid);
+      return NextResponse.json({ error: 'Invalid session identifier' }, { status: 400 });
+    }
     
     console.log(`[PROXY] GET /${uuid} - Requesting session information`);
     
@@ -24,17 +40,9 @@ export async function GET(
     // Return response to client
     return NextResponse.json(response.data);
   } catch (error) {
-    console.error('[PROXY] Error retrieving session information:', error);
-    
-    // Handle errors
-    if (axios.isAxiosError(error)) {
-      const statusCode = error.response?.status || 500;
-      const errorMessage = error.response?.data || error.message;
-      return NextResponse.json({ error: errorMessage }, { status: statusCode });
-    }
-    
+    console.error('[SECURITY] Error retrieving session information');
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Unknown error' },
+      { error: 'Failed to retrieve session information' },
       { status: 500 }
     );
   }

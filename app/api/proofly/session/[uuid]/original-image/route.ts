@@ -12,28 +12,60 @@ interface RouteParams {
 /**
  * Proxy handler for retrieving original image
  */
+function isValidUuid(uuid: string): boolean {
+  // Any standard UUID (v1-v5, v7)
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid);
+}
+
 export async function GET(request: NextRequest, context: RouteParams) {
   try {
     // Get UUID from route parameters
     const params = await context.params;
     const uuid = params.uuid;
     
+    // 2.1. UUID validation (any standard UUID)
+    if (!isValidUuid(uuid)) {
+      console.error('[SECURITY] Invalid UUID format:', uuid);
+      return new NextResponse('Invalid session identifier', { status: 400 });
+    }
+    // 2.2. Path traversal protection
+    if (uuid.includes('..') || /%2e%2e/i.test(uuid)) {
+      console.error('[SECURITY] Path traversal attempt in UUID:', uuid);
+      return new NextResponse('Invalid session identifier', { status: 400 });
+    }
+    
     console.log(`[PROXY] Request for original image for session ${uuid}`);
     
-    // Use correct API path to get image
-    const response = await axios.get(`${API_BASE_URL}/storage/original/${uuid}.jpeg`, {
-      responseType: 'arraybuffer',
-      headers: {
-        'accept': 'application/octet-stream'
-      }
-    });
-    
-    // Get content type from headers
+    // Get image_path from response to /api/${uuid}
+    const sessionResponse = await axios.get(`${API_BASE_URL}/${uuid}`);
+    const imagePath = sessionResponse.data?.image_path;
+    if (!imagePath || typeof imagePath !== 'string' || !imagePath.match(/^(\.?\/storage\/original\/)[\w\-/]+\.jpg$/)) {
+      console.error('[SECURITY] Invalid or missing image_path:', imagePath);
+      return new NextResponse('Image not found', { status: 404 });
+    }
+    // Protection: prevent path traversal
+    if (imagePath.includes('..') || imagePath.includes('//')) {
+      console.error('[SECURITY] Suspicious image_path:', imagePath);
+      return new NextResponse('Image not found', { status: 404 });
+    }
+    // Build full path for request to storage
+    let storagePath = imagePath;
+    if (storagePath.startsWith('.')) storagePath = storagePath.slice(1);
+    const imageUrl = `${API_BASE_URL}${storagePath}`;
+    let response;
+    try {
+      response = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        headers: {
+          'accept': 'application/octet-stream'
+        },
+        maxRedirects: 0
+      });
+    } catch (err) {
+      console.error('[SECURITY] Error retrieving original image from storage:', err);
+      return new NextResponse('Error retrieving image', { status: 500 });
+    }
     const contentType = response.headers['content-type'] || 'image/jpeg';
-    
-    console.log(`[PROXY] Original image retrieved, type: ${contentType}`);
-    
-    // Return image
     return new NextResponse(response.data, {
       headers: {
         'Content-Type': contentType,
@@ -41,22 +73,7 @@ export async function GET(request: NextRequest, context: RouteParams) {
       }
     });
   } catch (error) {
-    console.error('[PROXY] Error retrieving original image:', error);
-    
-    // Handle errors
-    if (axios.isAxiosError(error)) {
-      const statusCode = error.response?.status || 500;
-      console.error('Error details:', {
-        url: error.config?.url,
-        status: error.response?.status,
-        data: error.response?.data
-      });
-      return new NextResponse('Error retrieving image', { status: statusCode });
-    }
-    
-    return new NextResponse(
-      'Error retrieving image', 
-      { status: 500 }
-    );
+    console.error('[SECURITY] Error retrieving original image');
+    return new NextResponse('Error retrieving image', { status: 500 });
   }
 } 

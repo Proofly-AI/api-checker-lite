@@ -7,6 +7,11 @@ const PROOFLY_API_BASE_URL = 'https://api.proofly.ai';
 /**
  * Proxy handler for retrieving a face image
  */
+function isValidUuid(uuid: string): boolean {
+  // Any standard UUID (v1-v5, v7)
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid);
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: { uuid: string; faceId: string } }
@@ -22,14 +27,31 @@ export async function GET(
     const uuid = parts[4];
     const faceId = parts[6];
 
-    // Validate faceId
-    if (!/^[0-9]+$/.test(faceId)) {
-      console.error(`[API Face Proxy] Invalid faceId format: ${faceId}`);
-      return NextResponse.json({ error: 'Invalid face ID format' }, { status: 400 });
+    // 2.1. Check UUID (any standard UUID)
+    if (!isValidUuid(uuid)) {
+      console.error('[SECURITY] Invalid UUID format:', uuid);
+      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
+    }
+    // 2.2. Path traversal
+    if (uuid.includes('..') || /%2e%2e/i.test(uuid)) {
+      console.error('[SECURITY] Path traversal attempt in UUID:', uuid);
+      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
+    }
+    // 2.3. Validate faceId (only positive numbers)
+    if (!/^[0-9]+$/.test(faceId) || parseInt(faceId, 10) < 0) {
+      console.error('[SECURITY] Invalid faceId format:', faceId);
+      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
     }
     const faceIndex = parseInt(faceId, 10);
     if (!uuid || isNaN(faceIndex) || faceIndex < 0) {
-      return NextResponse.json({ error: 'Invalid UUID or Face ID format' }, { status: 400 });
+      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
+    }
+
+    // 3.3. Strict routing: only allow access to /api/proofly/session/[uuid]/face/[faceId]
+    const validPathRegex = /^\/api\/proofly\/session\/[0-9a-f\-]{36}\/face\/[0-9]+$/i;
+    if (!validPathRegex.test(pathname)) {
+      console.error('[SECURITY] Path does not match strict routing pattern:', pathname);
+      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
     }
 
     // 1. Get session info from Proofly API
@@ -38,49 +60,51 @@ export async function GET(
     try {
       sessionInfoResponse = await axios.get(sessionInfoUrl);
     } catch (sessionError: any) {
-      console.error(`[API Face Proxy] Error fetching session info for ${uuid}:`, sessionError.response?.status, sessionError.response?.data);
-      if (sessionError.response?.status === 404) {
-        return NextResponse.json({ error: 'Session not found on Proofly API' }, { status: 404 });
-      }
-      throw new Error('Failed to fetch session info from Proofly API');
+      console.error(`[API Face Proxy] Error fetching session info for ${uuid}`);
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
     }
     const sessionData = sessionInfoResponse.data;
     if (!sessionData || !Array.isArray(sessionData.faces) || sessionData.faces.length === 0) {
       console.error(`[API Face Proxy] No faces found in session data for ${uuid}`);
-      return NextResponse.json({ error: 'No faces found in session data' }, { status: 404 });
+      return NextResponse.json({ error: 'Not found' }, { status: 404 });
     }
 
-    // 2. Find the target face object in the array
+    // 3.1. Check that face_path belongs only to api.proofly.ai
     const targetFace = sessionData.faces.find((face: any) => {
       if (!face || !face.face_path) return false;
+      const allowed =
+        (face.face_path.startsWith('./storage/original/') ||
+         face.face_path.startsWith('/storage/original/') ||
+         face.face_path.startsWith('/storage/faces/')) &&
+        !face.face_path.includes('..') &&
+        !face.face_path.includes('//');
+      if (!allowed) {
+        console.error('[SECURITY] Suspicious face_path:', face.face_path);
+        return false;
+      }
       const match = face.face_path.match(/_(\d+)\.[^.]+$/);
       return match && parseInt(match[1], 10) === faceIndex;
     });
     if (!targetFace || !targetFace.face_path) {
-      console.error(`[API Face Proxy] Face with index ${faceIndex} not found in session ${uuid}. Available paths:`, sessionData.faces.map((f:any) => f.face_path));
-      return NextResponse.json({ error: `Face index ${faceIndex} not found` }, { status: 404 });
+      console.error(`[API Face Proxy] Face with index ${faceIndex} not found in session ${uuid}`);
+      return NextResponse.json({ error: 'Not found' }, { status: 404 });
     }
-
-    // 3. Extract filename from face_path
+    // 3.2. Do not allow redirects when downloading files/images
     const filename = path.basename(targetFace.face_path);
     if (!filename) {
       console.error(`[API Face Proxy] Could not extract filename from face_path: ${targetFace.face_path}`);
-      throw new Error('Could not parse face path');
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
     }
-
-    // 4. Form URL for fetching face image from Proofly API
     const faceImageUrl = `${PROOFLY_API_BASE_URL}/api/storage/faces/${filename}`;
     let imageResponse;
     try {
       imageResponse = await axios.get(faceImageUrl, {
         responseType: 'arraybuffer',
+        maxRedirects: 0
       });
     } catch (imageError: any) {
-      console.error(`[API Face Proxy] Error fetching face image ${filename} from Proofly API. Status: ${imageError.response?.status}`);
-      if (imageError.response?.status === 404) {
-        return NextResponse.json({ error: 'Face image not found on Proofly storage' }, { status: 404 });
-      }
-      throw new Error('Failed to fetch face image from Proofly API');
+      console.error(`[API Face Proxy] Error fetching face image for ${uuid} file ${filename}`);
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
     }
 
     const contentType = imageResponse.headers['content-type'] || 'image/jpeg';
@@ -91,7 +115,7 @@ export async function GET(
       },
     });
   } catch (error) {
-    console.error('[API Face Proxy] Fatal error:', error);
+    console.error('[SECURITY] Fatal error in face proxy');
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

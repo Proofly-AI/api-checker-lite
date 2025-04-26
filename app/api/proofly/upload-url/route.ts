@@ -4,6 +4,38 @@ import FormData from 'form-data';
 
 const API_BASE_URL = 'https://api.proofly.ai/api';
 
+function isHttpOrHttps(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isPrivateIp(host: string): boolean {
+  // IPv4 localhost
+  if (host === '127.0.0.1') return true;
+  // IPv6 localhost
+  if (host === '::1') return true;
+  // Add additional ranges as needed
+  return false;
+}
+
+async function safeResolveHost(url: string): Promise<string | null> {
+  try {
+    const u = new URL(url);
+    const addresses = await (await import('dns')).promises.lookup(u.hostname, { all: true });
+    return addresses[0]?.address || null;
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyImageContentType(contentType: string): boolean {
+  return contentType && contentType.startsWith('image/');
+}
+
 /**
  * Request handler for uploading image URL to Proofly API
  */
@@ -18,28 +50,56 @@ export async function POST(req: NextRequest) {
       );
     }
     
-    // Check if it's a valid image URL
-    if (!isValidImageUrl(url)) {
-      return NextResponse.json(
-        { error: 'Invalid image URL' },
-        { status: 400 }
-      );
+    // 1. Allow only http/https
+    if (!isHttpOrHttps(url)) {
+      return NextResponse.json({ error: 'Only http/https URLs are allowed' }, { status: 400 });
+    }
+    
+    // 2. Block private/local IPs
+    const resolvedIp = await safeResolveHost(url);
+    if (!resolvedIp || isPrivateIp(resolvedIp)) {
+      return NextResponse.json({ error: 'URL resolves to private/local IP' }, { status: 400 });
+    }
+    
+    // 3. Limit URL length
+    if (url.length > 512) {
+      return NextResponse.json({ error: 'URL too long' }, { status: 400 });
     }
     
     console.log('[PROXY] Downloading image from URL:', url.substring(0, 100) + (url.length > 100 ? '...' : ''));
     
-    // Step 1: Download image from URL
-    const imageResponse = await axios.get(url, { 
-      responseType: 'arraybuffer',
-      timeout: 30000 
-    });
+    // 4. Download image (20-second timeout, User-Agent and Referer as browser)
+    let imageResponse;
+    try {
+      imageResponse = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 20000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          'Referer': url
+        }
+      });
+    } catch (err: any) {
+      console.error('[SECURITY] Error or suspicious URL upload:', err);
+      if (err.response) {
+        console.error('Error response status:', err.response.status);
+        console.error('Error response headers:', err.response.headers);
+      }
+      return NextResponse.json({ error: 'Failed to download image from URL' }, { status: 500 });
+    }
     
     if (!imageResponse.data) {
       throw new Error('Failed to download image from URL');
     }
     
+    // 5. Check Content-Type
+    const contentType = imageResponse.headers['content-type'] || '';
+    if (!isLikelyImageContentType(contentType)) {
+      return NextResponse.json({ error: 'URL does not point to an image' }, { status: 400 });
+    }
+    
     // Get image type from headers
-    const contentType = imageResponse.headers['content-type'] || 'image/jpeg';
     console.log('[PROXY] Downloaded image type:', contentType);
     
     // Create buffer from response data
@@ -79,9 +139,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ uuid: response.data.uuid });
     
   } catch (error) {
-    console.error('Error processing URL:', error);
+    // Logging suspicious requests
+    console.error('[SECURITY] Error or suspicious URL upload:', error);
     
-    // Handle API errors
     if (axios.isAxiosError(error)) {
       console.error('Request details:', {
         url: error.config?.url,
@@ -130,21 +190,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-
-/**
- * Checks if URL points to an image
- */
-function isValidImageUrl(url: string): boolean {
-  try {
-    // Simple URL validation
-    new URL(url);
-    
-    // File extension or MIME-type check can be added here
-    // For simplicity, we accept all valid URLs, but in production
-    // a more strict validation should be implemented
-    
-    return true;
-  } catch (e) {
-    return false;
-  }
-} 
